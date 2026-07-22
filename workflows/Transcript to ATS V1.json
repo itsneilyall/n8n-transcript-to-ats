@@ -1,0 +1,968 @@
+{
+  "name": "Transcript to ATS V1",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Belo - Transcript Ingestion",
+        "formDescription": "Upload one or more recruiter call transcripts (.txt). Each becomes a Conversation record; candidates are created or updated automatically.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Transcripts",
+              "fieldType": "file",
+              "acceptFileTypes": ".txt",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -144,
+        608
+      ],
+      "id": "5c852f53-247e-43e2-8331-d9e3a49459bc",
+      "name": "On Transcript Upload",
+      "webhookId": "1355c3f4-4bd4-4b8c-81a8-3dff5310bea6",
+      "notes": "Upload beats a folder read here: no volume to mount on Railway, and it is demoable. Swap for a Google Drive watch or S3 trigger in production."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "airtableBaseId",
+              "value": "app9H0XAt7jTWmv5l",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "tableCandidates",
+              "value": "Candidates",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "tableConversations",
+              "value": "Conversations",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "tableCompanies",
+              "value": "Companies",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "tableOpportunities",
+              "value": "Opportunities",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "tableInterviews",
+              "value": "Interviews",
+              "type": "string"
+            },
+            {
+              "id": "a7",
+              "name": "tableReviewQueue",
+              "value": "Review Queue",
+              "type": "string"
+            },
+            {
+              "id": "a9",
+              "name": "mergeThreshold",
+              "value": 70,
+              "type": "number"
+            },
+            {
+              "id": "a10",
+              "name": "reviewThreshold",
+              "value": 40,
+              "type": "number"
+            },
+            {
+              "id": "a11",
+              "name": "slackChannelId",
+              "value": "C0BJ41H24BV",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        80,
+        608
+      ],
+      "id": "1c38a2f9-f30c-4ee0-afec-73c8107c35f5",
+      "name": "Config",
+      "notes": "Single place to change base id, table names and the identity-match thresholds. includeBinary must stay ON - the uploaded files ride through this node."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Form Trigger puts every uploaded file on ONE item, as binary keys named\n// after the field label (\"Transcripts_0\", \"Transcripts_1\", ...). Fan them out\n// into one item per file, and normalise the binary key to 'data' so the rest\n// of the workflow does not care where the files came from.\nconst out = [];\nfor (const item of $input.all()) {\n  const bin = item.binary || {};\n  for (const key of Object.keys(bin)) {\n    const b = bin[key];\n    out.push({ json: { fileName: b.fileName || key, mimeType: b.mimeType || null }, binary: { data: b } });\n  }\n}\nif (out.length === 0) {\n  // Fail here, loudly, with a message a human can act on - rather than letting\n  // an empty item drift downstream and blow up somewhere unhelpful.\n  throw new Error('No files received. Attach the transcript .txt files to the form and submit again.');\n}\nout.sort((a, b) => String(a.json.fileName).localeCompare(String(b.json.fileName), undefined, { numeric: true }));\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        608
+      ],
+      "id": "0d635c96-5ccf-41d9-a1c2-80805b2ebfc0",
+      "name": "Split Files Into Items",
+      "notes": "Fans the form's multi-file upload out to one item per file and renames the binary key to 'data'."
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "destinationKey": "content",
+        "options": {
+          "encoding": "utf8",
+          "keepSource": "both"
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        528,
+        608
+      ],
+      "id": "f5c82fdf-e120-4f39-b91b-fc9b5ea6e7db",
+      "name": "Extract Text From File"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the transcript header, derive a deterministic conversation id,\n// and sort every transcript by date ASCENDING before we touch Airtable.\n// Ordering matters: the Candidates table holds \"latest state\", so an\n// out-of-order write would let March overwrite July.\n\nconst MONTHS = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06',\n  jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };\n\n// Accept the formats a recruiter's tooling actually emits. Anything we cannot\n// parse stays null - the LLM gets a second attempt at it from the content, and\n// if that fails too the transcript goes to the Review Queue rather than being\n// guessed at. A wrong date silently corrupts \"latest state\".\nconst parseDate = (s) => {\n  if (!s) return null;\n  const t = String(s).trim();\n  let m;\n  // 2026-03-04\n  m = t.match(/(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (m) return m[1] + '-' + m[2] + '-' + m[3];\n  // 4 March 2026 / 4th Mar 2026\n  m = t.match(/(\\d{1,2})(?:st|nd|rd|th)?\\s+([A-Za-z]{3,})\\s+(\\d{4})/);\n  if (m && MONTHS[m[2].slice(0, 3).toLowerCase()]) {\n    return m[3] + '-' + MONTHS[m[2].slice(0, 3).toLowerCase()] + '-' + String(m[1]).padStart(2, '0');\n  }\n  // March 4, 2026 / Mar 4 2026\n  m = t.match(/([A-Za-z]{3,})\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})/);\n  if (m && MONTHS[m[1].slice(0, 3).toLowerCase()]) {\n    return m[3] + '-' + MONTHS[m[1].slice(0, 3).toLowerCase()] + '-' + String(m[2]).padStart(2, '0');\n  }\n  // 04/03/2026 - assume DD/MM (UK). Ambiguous, so flagged downstream.\n  m = t.match(/(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})/);\n  if (m) return m[3] + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[1]).padStart(2, '0');\n  return null;\n};\n\nconst fnv1a = (s) => {\n  let h = 2166136261;\n  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }\n  return (h >>> 0).toString(36);\n};\n\nconst out = [];\nconst all = $input.all();\n\nfor (let idx = 0; idx < all.length; idx++) {\n  const item = all[idx];\n  const text = String(item.json.content || '');\n  const fileName = item.json.fileName || (item.binary && item.binary.data && item.binary.data.fileName) || ('transcript-' + (idx + 1) + '.txt');\n\n  const pick = (label) => {\n    const m = text.match(new RegExp('^' + label + ':\\\\s*(.+)$', 'mi'));\n    return m ? m[1].trim() : '';\n  };\n\n  const title = pick('Title');\n  const rawDate = pick('Date');\n  const duration = pick('Duration');\n  const participants = pick('Participants');\n  const transcriptDate = parseDate(rawDate);\n\n  // Deterministic => re-running the workflow upserts instead of duplicating.\n  // Falls back to hashing the body when there is no header at all.\n  const seed = (title || '') + '|' + (transcriptDate || rawDate || '') + '|' + (title ? '' : text.slice(0, 400));\n  const conversationId = 'conv_' + fnv1a(seed || fileName);\n\n  out.push({ json: { fileName, title, rawDate, transcriptDate, duration, participants, conversationId, transcript: text } });\n}\n\n// Date ASCENDING. Undated transcripts go LAST but cannot corrupt anything:\n// the staleness guard in Resolve Identity compares real dates before allowing\n// any overwrite of \"latest state\".\nout.sort((a, b) => String(a.json.transcriptDate || '9999-99-99').localeCompare(String(b.json.transcriptDate || '9999-99-99')));\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        736,
+        608
+      ],
+      "id": "7cfd9f23-5854-4a92-88c4-194ca6d74c00",
+      "name": "Parse & Sort Transcripts",
+      "notes": "Sorts by date ASC. Without this, March can overwrite July in the Candidates table."
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        960,
+        608
+      ],
+      "id": "5f35d516-ae44-4fb4-930f-b4a549f11eed",
+      "name": "Loop Over Transcripts",
+      "notes": "Batch size 1 = strictly sequential. Parallel processing would race on the candidate lookup and create duplicates."
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are an extraction engine for a recruitment ATS. You read a single transcript of a recorded call and return ONE JSON object. No prose, no markdown, no code fences.\n\nRULES\n1. Extract only what the transcript supports. Never infer, never invent, never fill gaps from world knowledge. Unknown -> null (or [] for lists).\n2. SUBJECT OF RECORD. Every record is about exactly ONE person. If the header has a \"Title:\" line, the name at the front of it IS the subject - use it verbatim for candidate.full_name, even if that person never speaks on the call. If there is no header, the subject is the person the call is about. Never emit a candidate for someone merely mentioned: interviewers, hiring managers, CEOs, colleagues, referrals and friends are NOT the subject, however much detail is given about them.\n3. Money: convert spoken UK shorthand to integers in GBP. \"seventy base\" -> 70000. \"one-forty OTE\" -> 140000. \"two-forty\" -> 240000. Unknown -> null.\n4. Dates: ISO YYYY-MM-DD. conversation.date comes from the header \"Date:\" line; if there is no header, infer it from the content, and only use null if it is genuinely unknowable. If the transcript refers to a day rather than a date (\"Thursday at two\"), resolve it against the conversation date and output the ISO date.\n5. Not every call is with the candidate. If the other participant is a client/hiring manager giving feedback ABOUT the subject, set conversation.source_type = \"Client\". In that case only populate candidate fields the client explicitly asserts and leave the rest null - do NOT restate the candidate's own prior claims, and do NOT guess. A null here is correct and safe; a guess is not.\n6. candidate.preferred_name is the shortened/informal name if one is used (e.g. \"Priya\" for \"Priyanka\"). Otherwise null.\n7. company_history must list EVERY employer named for the subject: current first, then previous. Use the fullest form of each name given anywhere in the transcript (\"Nexler Health\", not \"Nexler\"). If a company has been renamed or merged, list BOTH the new and the old name.\n8. Expand abbreviated job titles to their full form (\"EAE\" -> \"Enterprise Account Executive\", \"AE\" -> \"Account Executive\"). Use the fullest form of a hiring company's name (\"Helix Data\", not \"Helix\").\n9. EMPLOYER vs HIRING COMPANY. company_history is where the SUBJECT has WORKED. opportunity.company is a company they are INTERVIEWING WITH. Never put a hiring company in company_history or vice versa. Be especially careful when a candidate's current employer and a company they are interviewing at have similar names - they are different companies and must be kept separate.\n10. INTERVIEWS ARE PER ROUND. A single call may describe more than one interview - e.g. a panel or a multi-hour session with different people. Emit ONE entry in \"interviews\" for each distinct interviewer or round, each with its own outcome/feedback. Do not collapse two rounds into one.\n11. LOCATION IS CURRENT. candidate.location is where the subject is based right NOW. A planned or future move (\"moving to London in September\") is NOT the current location - put it in preferred_location and note the timing in timing_constraints.\n12. If the transcript states two conflicting versions of a fact (e.g. a title that HR has not updated), take the one the subject says is currently true and put the conflict in \"unclear\".\n13. Set extraction_confidence between 0 and 1 for how confident you are the object is faithful to the transcript. List anything genuinely ambiguous in \"unclear\".\n14. tags: 3-5 short tags across vertical, location, seniority band, motion. Title Case.\n\nSCHEMA (return exactly these keys)\n{\n  \"conversation\": {\n    \"type\": \"First Call\" | \"Catch-up\" | \"Interview Prep\" | \"Client Feedback\" | \"Offer Discussion\" | \"Other\",\n    \"source_type\": \"Candidate\" | \"Client\" | \"Internal\",\n    \"date\": \"YYYY-MM-DD\" | null,\n    \"recruiter\": string | null,\n    \"summary\": string,\n    \"sentiment\": \"Positive\" | \"Neutral\" | \"Negative\" | \"Mixed\",\n    \"next_action\": string | null,\n    \"confidential\": boolean\n  },\n  \"candidate\": {\n    \"full_name\": string | null,\n    \"preferred_name\": string | null,\n    \"first_name\": string | null,\n    \"surname\": string | null,\n    \"current_role\": string | null,\n    \"current_company\": string | null,\n    \"seniority\": \"SDR\" | \"AE\" | \"Senior AE\" | \"Enterprise AE\" | \"Lead\" | \"Director\" | \"VP\" | \"CRO\" | \"Other\" | null,\n    \"location\": string | null,\n    \"preferred_location\": string | null,\n    \"remote_preference\": string | null,\n    \"current_base\": number | null,\n    \"current_ote\": number | null,\n    \"desired_base\": number | null,\n    \"desired_ote\": number | null,\n    \"equity_importance\": \"Low\" | \"Medium\" | \"High\" | null,\n    \"skills\": string[],\n    \"methodologies\": string[],\n    \"languages\": string[],\n    \"preferred_industries\": string[],\n    \"company_history\": string[],\n    \"education\": string | null,\n    \"career_goal\": string | null,\n    \"timing_constraints\": string | null\n  },\n  \"companies\": [ { \"name\": string, \"industry\": string | null, \"relationship\": \"Current Employer\" | \"Previous Employer\" | \"Hiring Company\" | \"Mentioned\" } ],\n  \"opportunity\": null | { \"company\": string, \"role\": string, \"stage\": string, \"status\": string | null, \"base\": number | null, \"ote\": number | null, \"equity\": string | null, \"notes\": string | null },\n  \"interview\": [ { \"date\": \"YYYY-MM-DD\" | null, \"stage\": string | null, \"interviewer\": string | null, \"outcome\": string | null, \"strengths\": string | null, \"weaknesses\": string | null, \"feedback\": string | null } ],\n  \"tags\": string[],\n  \"extraction_confidence\": number,\n  \"unclear\": string[]\n}",
+              "role": "system"
+            },
+            {
+              "content": "=Transcript file: {{ $json.fileName }}\nHeader date: {{ $json.transcriptDate }}\nTitle: {{ $json.title }}\nParticipants: {{ $json.participants }}\n\n--- TRANSCRIPT START ---\n{{ $json.transcript }}\n--- TRANSCRIPT END ---"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        1232,
+        656
+      ],
+      "id": "fe28c07e-058e-4b42-85a2-9baadcac92d3",
+      "name": "Extract Structured Data",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "openAiApi": {
+          "id": "so11cSNBhLaPJR3i",
+          "name": "OpenAi account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "temperature 0, JSON mode. Error output goes to the review queue rather than killing the run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Schema-validate the LLM output BEFORE it can touch Airtable.\n// Anything that fails here goes to the Review Queue, not into the base.\n\nconst raw = $input.first().json || {};\nconst meta = $('Loop Over Transcripts').first().json;\n\nlet data = raw.message && raw.message.content !== undefined ? raw.message.content\n         : (raw.content !== undefined ? raw.content\n         : (raw.output !== undefined ? raw.output : raw));\n\nif (typeof data === 'string') {\n  const cleaned = data.replace(/```json/gi, '').replace(/```/g, '').trim();\n  try { data = JSON.parse(cleaned); } catch (e) { data = null; }\n}\n\nconst errors = [];\nif (!data || typeof data !== 'object') errors.push('LLM did not return parseable JSON');\n\nconst cand = (data && data.candidate) || {};\nconst conv = (data && data.conversation) || {};\n\nif (!cand.full_name) errors.push('Missing candidate.full_name');\nif (!conv.type) errors.push('Missing conversation.type');\nif (!cand.current_role && !cand.current_company) errors.push('Missing both current_role and current_company');\n\n// A conversation with no date cannot be ordered, so it cannot safely update\n// \"latest state\". Header parse failed AND the model could not infer one from\n// the content -> a human looks at it.\nconst resolvedDate = conv.date || meta.transcriptDate;\nif (!resolvedDate) errors.push('No conversation date could be resolved from the header or the content');\n\nconst norm = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]/g, '');\nconst parts = String(cand.full_name || '').trim().split(/\\s+/).filter(Boolean);\nconst firstName = cand.first_name || parts[0] || '';\nconst surname = cand.surname || (parts.length > 1 ? parts[parts.length - 1] : '');\nif (!surname) errors.push('Could not derive a surname');\n\nconst confidence = Number(data && data.extraction_confidence != null ? data.extraction_confidence : 0);\nif (confidence > 0 && confidence < 0.5) errors.push('Low extraction confidence: ' + confidence);\n\nconst result = {\n  _valid: errors.length === 0,\n  _errors: errors,\n  conversationId: meta.conversationId,\n  fileName: meta.fileName,\n  title: meta.title,\n  transcriptDate: resolvedDate,\n  duration: meta.duration,\n  participants: meta.participants,\n  transcript: meta.transcript,\n  firstName: firstName,\n  surname: surname,\n  firstNameKey: norm(firstName),\n  surnameKey: norm(surname),\n  confidence: confidence,\n  extraction: data || {}\n};\nreturn [{ json: result }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        608
+      ],
+      "id": "b0ef5d74-92af-4b74-a167-0f8e625af3e4",
+      "name": "Validate & Normalize"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json._valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1840,
+        608
+      ],
+      "id": "5cf24388-852c-45e6-8bfc-97781514a215",
+      "name": "Extraction Valid?"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.airtable.com/v0/{{ $('Config').first().json.airtableBaseId }}/{{ $('Config').first().json.tableCandidates }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "airtableTokenApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "filterByFormula",
+              "value": "={{ '{Surname Key} = \"' + $json.surnameKey + '\"' }}"
+            },
+            {
+              "name": "pageSize",
+              "value": "50"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2064,
+        512
+      ],
+      "id": "7503eec8-cd64-41f1-89dc-1c6fec9be0f7",
+      "name": "Search Candidates By Surname",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YgtCAc5jqvV34mee",
+          "name": "Airtable Belo"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Surname is the only cheap, reliable blocking key. Everything else is scored in the next node."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------------------\n// IDENTITY RESOLUTION\n//\n// The sample data contains both failure modes on purpose:\n//   * same person, two names      -> Priyanka Raghavan / Priya Raghavan\n//   * two people, identical name  -> David Chen (Fentra, London, mid-market AE)\n//                                    David Chen (Arden Cyber, Edinburgh, VP)\n//\n// The rule is NOT a score threshold. A threshold treats a quiet transcript as\n// evidence of a different person, which forks a candidate every time a call is\n// short or is with a client rather than the candidate.\n//\n// The rule is: merge on a name match UNLESS the transcript contradicts it.\n//   corroboration = both sides state something and the statements agree\n//   contradiction = both sides state something and the statements clash\n//   silence       = neither. Silence is not evidence.\n//\n// Invariants:\n//   1. Never silently merge two people   -> contradiction always splits + flags\n//   2. Never silently split one person   -> any un-merged name match is flagged\n//   3. Never decide when two records are equally plausible -> flag\n// ---------------------------------------------------------------------------\n\nconst search = $input.first().json || {};\nconst ctx = $('Validate & Normalize').first().json;\n\nconst norm = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]/g, '');\nconst fnv1a = (s) => {\n  let h = 2166136261;\n  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }\n  return (h >>> 0).toString(36);\n};\nconst toList = (v) => {\n  if (Array.isArray(v)) return v.filter(Boolean);\n  if (v === null || v === undefined || v === '') return [];\n  return String(v).split(',').map((x) => x.trim()).filter(Boolean);\n};\n\n// \"Nexler\" and \"Nexler Health\" are the same employer. \"Arden Cyber\" and\n// \"Fentra\" are not. Prefix tolerance both ways, min 4 chars to avoid noise.\nconst companyMatch = (a, b) => {\n  if (!a || !b) return false;\n  if (a === b) return true;\n  if (a.length >= 4 && b.startsWith(a)) return true;\n  if (b.length >= 4 && a.startsWith(b)) return true;\n  return false;\n};\n\n// \"Manchester\" vs \"Didsbury, Manchester\" vs \"Greater Manchester\" all agree.\n// \"London\" vs \"Edinburgh\" does not. Token overlap, not string equality.\nconst locTokens = (s) => String(s || '').toLowerCase().match(/[a-z]{3,}/g) || [];\nconst STOP_LOC = ['the', 'and', 'area', 'greater', 'city', 'centre', 'center', 'uk', 'england', 'based'];\nconst locOverlap = (a, b) => {\n  const A = locTokens(a).filter((t) => STOP_LOC.indexOf(t) === -1);\n  const B = locTokens(b).filter((t) => STOP_LOC.indexOf(t) === -1);\n  if (!A.length || !B.length) return null; // silence, not disagreement\n  return A.some((t) => B.indexOf(t) !== -1);\n};\n\nconst cand = ctx.extraction.candidate || {};\nconst newCompanies = [cand.current_company].concat(toList(cand.company_history)).map(norm).filter(Boolean);\nconst newLoc = cand.location;\nconst newEdu = norm(cand.education);\n\nconst records = Array.isArray(search.records) ? search.records : [];\nconst assessed = [];\n\nfor (const r of records) {\n  const f = r.fields || {};\n\n  // --- name / alias --------------------------------------------------------\n  const pool = [norm(f['First Name Key'])].concat(toList(f['Aliases']).map(norm)).filter(Boolean);\n  let nameScore = 0;\n  let exactName = false;\n  for (const p of pool) {\n    if (p === ctx.firstNameKey) { nameScore = Math.max(nameScore, 40); exactName = true; }\n    else if (p.length >= 3 && ctx.firstNameKey.length >= 3 && (p.startsWith(ctx.firstNameKey) || ctx.firstNameKey.startsWith(p))) {\n      nameScore = Math.max(nameScore, 30); // Priya <-> Priyanka\n    }\n  }\n\n  const exCompanies = toList(f['Company History']).map(norm).filter(Boolean);\n  const shared = exCompanies.filter((x) => newCompanies.some((y) => companyMatch(x, y)));\n  const locSame = locOverlap(f['Location'], newLoc); // true | false | null\n  const exEdu = norm(f['Education']);\n\n  const corroboration = [];\n  if (shared.length) corroboration.push(shared.length + ' shared employer(s)');\n  if (locSame === true) corroboration.push('same location');\n  if (exEdu && newEdu && exEdu === newEdu) corroboration.push('same education');\n\n  // A contradiction requires BOTH sides to have said something.\n  const contradiction = [];\n  if (exCompanies.length && newCompanies.length && !shared.length) {\n    contradiction.push('no employer in common');\n  }\n  if (locSame === false && !shared.length) {\n    contradiction.push('different location with no shared employer');\n  }\n\n  const score = nameScore\n    + (shared.length ? 30 : 0)\n    + (shared.length >= 2 ? 20 : 0)\n    + (locSame === true ? 15 : 0)\n    - (contradiction.length ? 40 : 0);\n\n  assessed.push({\n    id: r.id, fields: f, nameScore, exactName, corroboration, contradiction, score,\n    key: f['Candidate Key'], name: f['Full Name'], lastSeen: f['Last Conversation Date'] || null,\n    aliases: toList(f['Aliases']), companyHistory: toList(f['Company History']),\n  });\n}\n\nconst nameMatches = assessed.filter((a) => a.nameScore > 0).sort((a, b) => b.score - a.score);\nconst best = nameMatches[0] || null;\nconst viable = nameMatches.filter((a) => a.contradiction.length === 0);\n\nlet action = 'create';\nlet needsReview = false;\nlet reason = '';\nlet target = null;\n\nif (!best) {\n  reason = records.length\n    ? 'Surname matched ' + records.length + ' record(s), but no first name or alias is compatible'\n    : 'No existing candidate with this surname';\n} else if (viable.length === 0) {\n  // Every name match is contradicted by the evidence -> a different human.\n  action = 'create';\n  needsReview = true;\n  reason = 'Name matches \"' + best.name + '\" but the evidence contradicts it (' + best.contradiction.join('; ')\n    + '). Created as a separate person - confirm or merge.';\n} else if (viable.length > 1) {\n  // Two plausible people, nothing to separate them. Do not guess.\n  action = 'create';\n  needsReview = true;\n  reason = viable.length + ' existing candidates match this name and nothing in this transcript distinguishes them ('\n    + viable.map((v) => v.name).join(', ') + '). Created separately - please merge manually.';\n} else {\n  target = viable[0];\n  action = 'merge';\n  if (target.corroboration.length) {\n    reason = 'Merged into \"' + target.name + '\" - ' + target.corroboration.join('; ') + ' (score ' + target.score + ')';\n  } else {\n    // Name matched, nothing contradicts, but nothing corroborates either.\n    // Merge (silence is not evidence) but say so out loud.\n    needsReview = !target.exactName;\n    reason = 'Merged into \"' + target.name + '\" on name alone - this transcript states nothing that corroborates or contradicts it.'\n      + (target.exactName ? '' : ' Partial/alias name match, please confirm.');\n  }\n}\n\nconst candidateKey = action === 'merge'\n  ? target.key\n  : ctx.surnameKey + '-' + ctx.firstNameKey + '-' + fnv1a(ctx.surnameKey + '|' + ctx.firstNameKey + '|' + (newCompanies[0] || ''));\n\n// Only let this transcript overwrite \"latest state\" if it is the newest thing\n// we know. Protects against re-ingest and against an old file arriving late.\nlet updateState = true;\nif (action === 'merge' && target.lastSeen && ctx.transcriptDate && String(target.lastSeen) > String(ctx.transcriptDate)) {\n  updateState = false;\n  reason += ' | Older than the last known conversation - conversation logged, profile state left alone.';\n}\n\nconst resolved = {\n  conversationId: ctx.conversationId,\n  action, candidateKey,\n  matchedRecordId: target ? target.id : null,\n  score: best ? best.score : null,\n  corroboration: best ? best.corroboration : [],\n  contradiction: best ? best.contradiction : [],\n  needsReview, reason, updateState,\n  surnameMatchesConsidered: records.length,\n  // carried so the payload builder can UNION rather than overwrite\n  existing: target ? { fullName: target.name, aliases: target.aliases, companyHistory: target.companyHistory } : null,\n};\nreturn [{ json: resolved }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        512
+      ],
+      "id": "063b7df1-dd00-49fa-9e6f-66317e78b81b",
+      "name": "Resolve Identity",
+      "notes": "Priya != Priyanka by string compare, but is the same person. David Chen == David Chen by string compare, but is two people. This node is why."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the extraction + identity decision into Airtable upsert payloads.\n// Every table upserts on a deterministic primary key, so the whole workflow\n// is idempotent: run it ten times, get one set of records.\n\nconst ctx = $('Validate & Normalize').first().json;\nconst id = $input.first().json;\nconst e = ctx.extraction || {};\nconst c = e.candidate || {};\nconst conv = e.conversation || {};\n\nconst norm = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]/g, '');\nconst slug = (s) => String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');\nconst list = (v) => (Array.isArray(v) ? v.filter(Boolean) : []);\nconst clean = (o) => {\n  const r = {};\n  for (const k of Object.keys(o)) {\n    const v = o[k];\n    if (v === null || v === undefined || v === '') continue;\n    if (Array.isArray(v) && v.length === 0) continue;\n    r[k] = v;\n  }\n  return r;\n};\n\n// ---- aliases: UNION with what Airtable already holds ----------------------\n// Overwriting would lose \"Priyanka\" the moment a \"Priya\" transcript merges,\n// and the next \"Priyanka\" transcript would then fail to match.\nconst existing = id.existing || {};\nconst aliases = (existing.aliases || []).slice();\nfor (const n of [c.preferred_name, c.first_name, ctx.firstName]) {\n  if (n && aliases.indexOf(String(n)) === -1) aliases.push(String(n));\n}\n\n// ---- Candidate ------------------------------------------------------------\n// Identity fields are always written. \"Latest state\" fields only if this\n// transcript is the newest one we have for them.\nconst identityFields = {\n  'Candidate Key': id.candidateKey,\n  'Preferred Name': c.preferred_name,\n  'Surname Key': ctx.surnameKey,\n  'Aliases': aliases.join(', '),\n  'Needs Review': !!id.needsReview,\n  'Review Reason': id.needsReview ? id.reason : '',\n  'Match Score': id.score,\n  'Match Signals': ['corroborates: ' + (list(id.corroboration).join(', ') || 'nothing'),\n                    'contradicts: ' + (list(id.contradiction).join(', ') || 'nothing')].join(' | ')\n};\n\n// On a merge the earliest sighting stays canonical - later names become\n// aliases. On a create we set them for the first time.\nif (id.action === 'create') {\n  identityFields['Full Name'] = c.full_name;\n  identityFields['First Name Key'] = ctx.firstNameKey;\n}\n\nconst stateFields = id.updateState ? {\n  'Current Role': c.current_role,\n  'Current Company': c.current_company,\n  'Seniority': c.seniority,\n  'Location': c.location,\n  'Preferred Location': c.preferred_location,\n  'Remote Preference': c.remote_preference,\n  'Current Base': c.current_base,\n  'Current OTE': c.current_ote,\n  'Desired Base': c.desired_base,\n  'Desired OTE': c.desired_ote,\n  'Equity Importance': c.equity_importance,\n  'Skills': list(c.skills),\n  'Methodologies': list(c.methodologies),\n  'Languages': list(c.languages),\n  'Preferred Industries': list(c.preferred_industries),\n  'Education': c.education,\n  'Career Goal': c.career_goal,\n  'Timing Constraints': c.timing_constraints,\n  'Tags': list(e.tags),\n  'Last Conversation Date': ctx.transcriptDate\n} : {};\n\n// Company History is cumulative and is the strongest identity signal we have,\n// so it is UNIONed with Airtable rather than replaced. A transcript that only\n// names the current employer must not erase the employment history.\nconst history = (existing.companyHistory || []).slice();\nfor (const n of [c.current_company].concat(list(c.company_history))) {\n  if (n && history.indexOf(String(n)) === -1) history.push(String(n));\n}\nif (history.length) identityFields['Company History'] = history.join(', ');\n\nconst candidateFields = clean(Object.assign({}, identityFields, stateFields));\n// clean() strips false, so re-assert the checkbox explicitly\ncandidateFields['Needs Review'] = !!id.needsReview;\n\n// ---- Conversation (immutable log, one per transcript) ---------------------\nconst conversationFields = clean({\n  'Conversation ID': ctx.conversationId,\n  'Candidate': [id.candidateKey],\n  'Title': ctx.title,\n  'Date': ctx.transcriptDate,\n  'Type': conv.type,\n  'Source Type': conv.source_type,\n  'Recruiter': conv.recruiter,\n  'Participants': ctx.participants,\n  'Duration': ctx.duration,\n  'Summary': conv.summary,\n  'Sentiment': conv.sentiment,\n  'Next Action': conv.next_action,\n  'Confidential': !!conv.confidential,\n  'File Name': ctx.fileName,\n  'Extraction Confidence': ctx.confidence,\n  'Unclear': list(e.unclear).join(' | '),\n  'Raw Transcript': ctx.transcript,\n  // comp is a time series, not a scalar - snapshot it on the conversation\n  'Base At Time': c.current_base,\n  'OTE At Time': c.current_ote,\n  'Desired Base At Time': c.desired_base,\n  'Desired OTE At Time': c.desired_ote,\n  'Role At Time': c.current_role,\n  'Company At Time': c.current_company,\n  'Location At Time': c.location\n});\nconversationFields['Confidential'] = !!conv.confidential;\n\n// ---- Companies ------------------------------------------------------------\nconst companies = list(e.companies).map((x) => clean({\n  'Company Name': x.name,\n  'Industry': x.industry,\n  'Relationship': x.relationship\n})).filter((x) => x['Company Name']);\n\n// ---- Opportunity ----------------------------------------------------------\n// Keyed on candidate + COMPANY only, deliberately NOT the role text.\n// T6 calls it \"Enterprise Account Executive\", T7's header calls it \"EAE\".\n// Keying on role would split one process into two rows - which is exactly the\n// \"journey through a role\" the brief is asking for. A candidate having two\n// live roles at one company is rarer than a role being named two ways.\nconst o = e.opportunity;\nconst hasOpportunity = !!(o && o.company && o.role);\nlet opportunityFields = null;\nlet opportunityKey = null;\nif (hasOpportunity) {\n  opportunityKey = id.candidateKey + '__' + slug(o.company);\n  opportunityFields = clean({\n    'Opportunity Key': opportunityKey,\n    'Candidate': [id.candidateKey],\n    'Company Hiring': [o.company],\n    'Role': o.role,\n    'Stage': o.stage,\n    'Status': o.status,\n    'Base': o.base,\n    'OTE': o.ote,\n    'Equity': o.equity,\n    'Recruiter Notes': o.notes,\n    'Last Updated': ctx.transcriptDate\n  });\n}\n\n// ---- Interviews (array) ---------------------------------------------------\n// Keyed on stage + interviewer, NOT date. T6 previews the Thursday interview\n// and T7 reports its outcome; only one states a date. Keying on date would\n// duplicate. A single transcript can also describe several rounds (T8: Elena\n// then Priyesh) - each becomes its own row.\nconst rawInterviews = Array.isArray(e.interview) ? e.interview : (e.interview ? [e.interview] : []);\nconst interviews = [];\nif (hasOpportunity) {\n  for (const iv of rawInterviews) {\n    if (!iv || !(iv.stage || iv.interviewer || iv.feedback)) continue;\n    const disc = (slug(iv.stage || '') + '-' + slug(iv.interviewer || '')).replace(/^-|-$/g, '') || slug(iv.date || ctx.transcriptDate);\n    interviews.push(clean({\n      'Interview Key': opportunityKey + '__' + disc,\n      'Opportunity': [opportunityKey],\n      'Date': iv.date || null,\n      'Stage': iv.stage,\n      'Interviewer': iv.interviewer,\n      'Outcome': iv.outcome,\n      'Strengths': iv.strengths,\n      'Weaknesses': iv.weaknesses,\n      'Feedback': iv.feedback,\n      'Source Conversation': [ctx.conversationId]\n    }));\n  }\n}\nconst hasInterviews = interviews.length > 0;\n\nconst payload = {\n  candidateKey: id.candidateKey,\n  candidateFields,\n  conversationFields,\n  companies,\n  hasOpportunity,\n  opportunityFields,\n  hasInterviews,\n  interviews\n};\nreturn [{ json: payload }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2496,
+        512
+      ],
+      "id": "4dd7f054-2929-4e96-8799-3d7fb2974398",
+      "name": "Build Airtable Payloads"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.airtable.com/v0/{{ $('Config').first().json.airtableBaseId }}/{{ $('Config').first().json.tableCandidates }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "airtableTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ performUpsert: { fieldsToMergeOn: ['Candidate Key'] }, records: [{ fields: $json.candidateFields }], typecast: true }) }}",
+        "options": {
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2720,
+        512
+      ],
+      "id": "deef799c-fb23-4a3d-90fd-648e457aa52e",
+      "name": "Upsert Candidate",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YgtCAc5jqvV34mee",
+          "name": "Airtable Belo"
+        }
+      },
+      "notes": "PATCH + performUpsert on Candidate Key. Create and update are the same call, so re-runs are safe."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.airtable.com/v0/{{ $('Config').first().json.airtableBaseId }}/{{ $('Config').first().json.tableConversations }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "airtableTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ performUpsert: { fieldsToMergeOn: ['Conversation ID'] }, records: [{ fields: $('Build Airtable Payloads').first().json.conversationFields }], typecast: true }) }}",
+        "options": {
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2944,
+        512
+      ],
+      "id": "446835e5-ac2d-4d56-8d82-bd505ecff10c",
+      "name": "Upsert Conversation",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YgtCAc5jqvV34mee",
+          "name": "Airtable Belo"
+        }
+      },
+      "notes": "Conversations are append-only history. typecast:true resolves the Candidate link by primary key."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $('Build Airtable Payloads').first().json.hasOpportunity }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3168,
+        512
+      ],
+      "id": "0eb4e087-a016-4153-998e-632e11bac981",
+      "name": "Opportunity Mentioned?"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.airtable.com/v0/{{ $('Config').first().json.airtableBaseId }}/{{ $('Config').first().json.tableOpportunities }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "airtableTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ performUpsert: { fieldsToMergeOn: ['Opportunity Key'] }, records: [{ fields: $('Build Airtable Payloads').first().json.opportunityFields }], typecast: true }) }}",
+        "options": {
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3376,
+        432
+      ],
+      "id": "c3aaa23c-6b38-40c4-878e-318bf7a63065",
+      "name": "Upsert Opportunity",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YgtCAc5jqvV34mee",
+          "name": "Airtable Belo"
+        }
+      },
+      "notes": "One row per candidate x company x role. This is the 'journey through a role' the brief asks for."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c3",
+              "leftValue": "={{ $('Build Airtable Payloads').first().json.hasInterviews }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        432
+      ],
+      "id": "a28d87bf-96cc-4a43-aef5-df78b020f863",
+      "name": "Interview Mentioned?"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.airtable.com/v0/{{ $('Config').first().json.airtableBaseId }}/{{ $('Config').first().json.tableInterviews }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "airtableTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ performUpsert: { fieldsToMergeOn: ['Interview Key'] }, records: $('Build Airtable Payloads').first().json.interviews.map(f => ({ fields: f })), typecast: true }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3824,
+        352
+      ],
+      "id": "978e2c08-6f4c-43d5-9076-0119a64b2186",
+      "name": "Upsert Interview",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YgtCAc5jqvV34mee",
+          "name": "Airtable Belo"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Batched: sends ALL interview rounds from one transcript in a single upsert. T8 (Elena + Priyesh) writes two rows in one call. Hangs off Opportunity, not Candidate."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The OpenAI node failed after its retries. Do not stop the run - park the\n// transcript in the Review Queue and carry on with the rest.\nconst meta = $('Loop Over Transcripts').first().json;\nconst err = $input.first().json || {};\nconst row = {\n  conversationId: meta.conversationId,\n  fileName: meta.fileName,\n  title: meta.title,\n  transcriptDate: meta.transcriptDate,\n  transcript: meta.transcript,\n  stage: 'Extraction',\n  _errors: [String(err.error || err.message || 'OpenAI extraction failed after retries')]\n};\nreturn [{ json: row }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        864
+      ],
+      "id": "5fe74776-86c7-427a-8c20-6ffe66ce51d6",
+      "name": "Handle Extraction Error"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.airtable.com/v0/{{ $('Config').first().json.airtableBaseId }}/{{ $('Config').first().json.tableReviewQueue }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "airtableTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ performUpsert: { fieldsToMergeOn: ['Conversation ID'] }, records: [{ fields: { 'Conversation ID': $json.conversationId, 'File Name': $json.fileName, 'Title': $json.title, 'Date': $json.transcriptDate, 'Stage': $json.stage || 'Validation', 'Reason': ($json._errors || []).join(' | '), 'Raw Transcript': $json.transcript, 'Status': 'Open' } }], typecast: true }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2064,
+        768
+      ],
+      "id": "f355a3c4-38f7-4b74-8413-f250e0f5defa",
+      "name": "Upsert Review Queue",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YgtCAc5jqvV34mee",
+          "name": "Airtable Belo"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "The human queue. Bad data never enters the main tables - it lands here with the raw transcript attached."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compact, per-transcript outcome row. Feeds the end-of-run summary.\n// NOTE: inside a Split In Batches loop, $('Node') returns that node's LAST\n// run - which may be a previous iteration. So we verify the conversationId\n// matches before trusting it.\nconst safe = (name) => { try { return $(name).first().json; } catch (e) { return null; } };\n\nconst meta = safe('Loop Over Transcripts') || {};\nlet v = safe('Validate & Normalize');\nif (!v || v.conversationId !== meta.conversationId) v = null;\nlet r = safe('Resolve Identity');\nif (!r || !v || r.conversationId !== v.conversationId) r = null;\n\nlet outcome = 'review';\nif (v && v._valid && r) outcome = r.action === 'merge' ? 'updated' : 'created';\n\nconst summary = {\n  file: meta.fileName || null,\n  date: (v && v.transcriptDate) || meta.transcriptDate || null,\n  candidate: (v && v.extraction && v.extraction.candidate && v.extraction.candidate.full_name) || null,\n  outcome: outcome,\n  needsReview: r ? !!r.needsReview : true,\n  matchScore: r ? r.score : null,\n  reason: r ? r.reason : (v && v._errors ? v._errors.join('; ') : 'Sent to review queue')\n};\nreturn [{ json: summary }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4048,
+        608
+      ],
+      "id": "8cae40c7-4df5-48c8-b2d7-2335948b026e",
+      "name": "Record Outcome"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Silence is not success. Every run reports, pass or fail.\nconst rows = $input.all().map((i) => i.json);\nconst counts = { processed: rows.length, created: 0, updated: 0, review: 0, flagged: 0 };\nfor (const r of rows) {\n  if (r.outcome === 'created') counts.created++;\n  else if (r.outcome === 'updated') counts.updated++;\n  else counts.review++;\n  if (r.needsReview) counts.flagged++;\n}\n\nconst lines = rows.map((r) => {\n  const mark = r.outcome === 'review' ? ':x:' : (r.needsReview ? ':warning:' : ':white_check_mark:');\n  return mark + ' *' + (r.candidate || 'unknown') + '* — ' + (r.file || '?') + ' (' + (r.date || '?') + ') → ' + r.outcome + (r.matchScore !== null && r.matchScore !== undefined ? ' [score ' + r.matchScore + ']' : '') + (r.reason ? '\\n     _' + r.reason + '_' : '');\n});\n\nconst text = [\n  '*Transcript ingestion run complete*',\n  counts.processed + ' processed · ' + counts.created + ' created · ' + counts.updated + ' updated · ' + counts.review + ' to review · ' + counts.flagged + ' flagged',\n  '',\n  lines.join('\\n')\n].join('\\n');\n\nconst result = { counts, rows, text };\nreturn [{ json: result }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        432
+      ],
+      "id": "654d61d8-301e-43bd-b80e-55e05ed117bd",
+      "name": "Build Run Summary"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $('Config').first().json.slackChannelId }}",
+          "mode": "id"
+        },
+        "text": "={{ $json.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1408,
+        432
+      ],
+      "id": "ce24360d-a16b-4e2c-b9da-aab08d4da793",
+      "name": "Notify Run Summary",
+      "webhookId": "bc5573ae-538e-4c1f-ae5c-9a948257921e",
+      "credentials": {
+        "slackApi": {
+          "id": "AAqJsBmpWwNwWCfc",
+          "name": "Slack account 2"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Fires every run, pass or fail. If this message stops arriving, the pipeline is broken."
+    },
+    {
+      "parameters": {
+        "content": "## Transcript → ATS ingestion\n\n**Read → extract → validate → resolve identity → upsert.**\n\nThe interesting node is **Resolve Identity**. The sample data contains two traps:\n\n- *Priyanka Raghavan* and *Priya Raghavan* are one person under two names.\n- The two *David Chens* are two different people with one name.\n\nA normalised string compare gets both wrong. We score surname + first-name/alias + shared employer history + location, and we **flag rather than merge** anything ambiguous. Wrongly merging two humans is unrecoverable; a flagged duplicate costs thirty seconds.\n\nOrder matters too: transcripts are sorted **date ascending** and processed **one at a time**, because the Candidates table holds latest state.",
+        "height": 520,
+        "width": 500,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -176,
+        896
+      ],
+      "id": "802a24ad-5186-4999-9de7-7f9513a75f8a",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "### Failure path\n\nNothing half-parsed gets into the base.\n\n1. OpenAI node retries twice, then routes to its **error output**.\n2. Schema validation rejects missing name / conversation type / role+company, or confidence < 0.5.\n3. Both land in **Review Queue** with the raw transcript.\n4. Every run posts a Slack summary — silence means broken.\n5. A separate **Error Trigger** workflow catches anything unhandled.",
+        "height": 380,
+        "width": 380,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1520,
+        1056
+      ],
+      "id": "d01e36e9-0145-41a9-abd5-d8cbb4c4f1c1",
+      "name": "Sticky Note1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "On Transcript Upload": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Split Files Into Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Files Into Items": {
+      "main": [
+        [
+          {
+            "node": "Extract Text From File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text From File": {
+      "main": [
+        [
+          {
+            "node": "Parse & Sort Transcripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Sort Transcripts": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Transcripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Transcripts": {
+      "main": [
+        [
+          {
+            "node": "Build Run Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract Structured Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Summary": {
+      "main": [
+        [
+          {
+            "node": "Notify Run Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Structured Data": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Extraction Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Extraction Error": {
+      "main": [
+        [
+          {
+            "node": "Upsert Review Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalize": {
+      "main": [
+        [
+          {
+            "node": "Extraction Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraction Valid?": {
+      "main": [
+        [
+          {
+            "node": "Search Candidates By Surname",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert Review Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Review Queue": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Candidates By Surname": {
+      "main": [
+        [
+          {
+            "node": "Resolve Identity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Identity": {
+      "main": [
+        [
+          {
+            "node": "Build Airtable Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Airtable Payloads": {
+      "main": [
+        [
+          {
+            "node": "Upsert Candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Candidate": {
+      "main": [
+        [
+          {
+            "node": "Upsert Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Conversation": {
+      "main": [
+        [
+          {
+            "node": "Opportunity Mentioned?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Opportunity Mentioned?": {
+      "main": [
+        [
+          {
+            "node": "Upsert Opportunity",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Opportunity": {
+      "main": [
+        [
+          {
+            "node": "Interview Mentioned?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interview Mentioned?": {
+      "main": [
+        [
+          {
+            "node": "Upsert Interview",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Interview": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Outcome": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Transcripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "qjT88wiXxOZhvXYn",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "3bd12c8f-4ddf-48d2-b3bb-dc030f7ee46e",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3e30bb2cf7aba2fb818c8c3aad8875f7fd246a42d95bae652044a35a52fabffe"
+  },
+  "nodeGroups": [],
+  "id": "6ffDR0Hf7J8oPk6n",
+  "tags": []
+}
