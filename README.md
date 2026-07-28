@@ -4,7 +4,8 @@ Turns raw recruiter call transcripts into structured, relational candidate data 
 
 **Transcript in, structured candidate and job data out, end to end.** n8n for orchestration, GPT-4o for extraction, Airtable for the ATS.
 
-![Uploading Transcript to ATS.png…]()
+<img width="1912" height="837" alt="Transcript to ATS" src="https://github.com/user-attachments/assets/fa5faaf0-5aa2-4173-a611-00034f678b12" />
+
 
 
 
