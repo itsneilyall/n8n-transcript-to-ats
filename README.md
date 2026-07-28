@@ -1,6 +1,6 @@
 # Transcript to ATS
 
-Turns raw recruiter call transcripts into structured, relational candidate data in an Airtable ATS. Built for  Belo technical assessment.
+Turns raw recruiter call transcripts into structured, relational candidate data in an Airtable ATS. Built for technical assessment.
 
 **Transcript in, structured candidate and job data out, end to end.** n8n for orchestration, GPT-4o for extraction, Airtable for the ATS.
 
